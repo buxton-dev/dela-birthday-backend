@@ -1,5 +1,5 @@
 // ============================================
-// DELA BIRTHDAY SUPPORT BACKEND - FIXED ERROR HANDLING
+// DELA BIRTHDAY - COMPLETE BACKEND
 // ============================================
 
 require('dotenv').config();
@@ -11,37 +11,19 @@ const app = express();
 app.use(cors());
 app.use(express.json());
 
-let supporters = [];
+// ─── DATA (In-memory for now) ───
+let supporters = [];        // Payment records
+let guests = [];            // Guest list (confirmed RSVPs)
 
-// ─── GET ACCESS TOKEN ───
-async function getAccessToken() {
-  const url =
-    process.env.MPESA_ENV === 'production'
-      ? 'https://api.safaricom.co.ke/oauth/v1/generate?grant_type=client_credentials'
-      : 'https://sandbox.safaricom.co.ke/oauth/v1/generate?grant_type=client_credentials';
+// ─── TEST DATA (You can remove this) ───
+// These will show up as examples
+const testGuests = [
+  { name: 'Delaquez', phone: '254712345678', status: 'confirmed', rsvp: true },
+  { name: 'Sandra', phone: '254798765432', status: 'confirmed', rsvp: true },
+];
+guests.push(...testGuests);
 
-  console.log('🔑 Getting token from:', url);
-  console.log('🔑 Consumer Key:', process.env.MPESA_CONSUMER_KEY ? '✅ SET' : '❌ MISSING');
-
-  const auth = Buffer.from(
-    `${process.env.MPESA_CONSUMER_KEY}:${process.env.MPESA_CONSUMER_SECRET}`
-  ).toString('base64');
-
-  try {
-    const response = await axios.get(url, {
-      headers: { Authorization: `Basic ${auth}` }
-    });
-    console.log('✅ Token obtained successfully');
-    return response.data.access_token;
-  } catch (error) {
-    console.error('❌ Failed to get token:');
-    console.error('   Status:', error.response?.status);
-    console.error('   Data:', JSON.stringify(error.response?.data, null, 2));
-    throw new Error('Failed to authenticate with Safaricom. Check your Consumer Key and Secret.');
-  }
-}
-
-// ─── FORMAT PHONE NUMBER ───
+// ─── HELPERS ───
 function formatPhone(phone) {
   let cleaned = phone.replace(/[\s\-\(\)]/g, '');
   cleaned = cleaned.replace(/^\+/, '');
@@ -52,30 +34,53 @@ function formatPhone(phone) {
   return cleaned;
 }
 
+function generateQRData(phone) {
+  // This will be used to generate QR codes
+  // The QR will contain: https://dela-birthday.surge.sh/rsvp?phone=254712345678
+  return `${process.env.FRONTEND_URL}/rsvp?phone=${phone}`;
+}
+
+// ─── GET ACCESS TOKEN ───
+async function getAccessToken() {
+  const url =
+    process.env.MPESA_ENV === 'production'
+      ? 'https://api.safaricom.co.ke/oauth/v1/generate?grant_type=client_credentials'
+      : 'https://sandbox.safaricom.co.ke/oauth/v1/generate?grant_type=client_credentials';
+
+  const auth = Buffer.from(
+    `${process.env.MPESA_CONSUMER_KEY}:${process.env.MPESA_CONSUMER_SECRET}`
+  ).toString('base64');
+
+  const response = await axios.get(url, {
+    headers: { Authorization: `Basic ${auth}` }
+  });
+
+  return response.data.access_token;
+}
+
 // ─── /pay ENDPOINT ───
 app.post('/pay', async (req, res) => {
   try {
     let { phone, amount, name } = req.body;
 
-    console.log('📥 Received:', { phone, amount, name });
-
     if (!phone || !amount || !name) {
       return res.status(400).json({ error: 'Name, phone, and amount are required.' });
     }
-    if (amount < 1) {
-      return res.status(400).json({ error: 'Amount must be at least 1 KES.' });
-    }
 
     const formattedPhone = formatPhone(phone);
-    console.log('📱 Formatted phone:', formattedPhone);
 
-    if (formattedPhone.length !== 12) {
-      return res.status(400).json({ 
-        error: `Invalid phone number. Got: ${formattedPhone}. Must be 12 digits with 254.` 
+    // Check if this phone already RSVP'd
+    const existingGuest = guests.find(g => g.phone === formattedPhone);
+    if (existingGuest && existingGuest.rsvp === true) {
+      // They already RSVP'd — skip payment flow and go straight to invitation
+      return res.json({
+        message: 'You are already on the guest list! 🎉',
+        checkoutRequestID: null,
+        alreadyConfirmed: true,
+        redirectUrl: `${process.env.FRONTEND_URL}/invitation.html?phone=${formattedPhone}`
       });
     }
 
-    // Get token
     const token = await getAccessToken();
 
     const timestamp = new Date()
@@ -92,17 +97,14 @@ app.post('/pay', async (req, res) => {
         ? 'https://api.safaricom.co.ke/mpesa/stkpush/v1/processrequest'
         : 'https://sandbox.safaricom.co.ke/mpesa/stkpush/v1/processrequest';
 
-    console.log('📤 Sending to Safaricom:');
-    console.log('   URL:', stkUrl);
-    console.log('   Shortcode:', process.env.MPESA_SHORTCODE);
-    console.log('   Phone:', formattedPhone);
-    console.log('   Amount:', amount);
-
     const payload = {
       BusinessShortCode: process.env.MPESA_SHORTCODE,
       Password: password,
       Timestamp: timestamp,
-      TransactionType: 'CustomerPayBillOnline',
+      TransactionType:
+        process.env.MPESA_ENV === 'production'
+          ? 'CustomerBuyGoodsOnline'
+          : 'CustomerPayBillOnline',
       Amount: Math.round(amount),
       PartyA: formattedPhone,
       PartyB: process.env.MPESA_SHORTCODE,
@@ -112,17 +114,11 @@ app.post('/pay', async (req, res) => {
       TransactionDesc: `Birthday support from ${name}`
     };
 
-    console.log('📤 Full Payload:', JSON.stringify(payload, null, 2));
-
     const stkResponse = await axios.post(stkUrl, payload, {
-      headers: { 
-        Authorization: `Bearer ${token}`,
-        'Content-Type': 'application/json'
-      }
+      headers: { Authorization: `Bearer ${token}` }
     });
 
-    console.log('✅ Success:', stkResponse.data);
-
+    // Store supporter as pending
     supporters.push({
       name,
       phone: formattedPhone,
@@ -135,46 +131,68 @@ app.post('/pay', async (req, res) => {
       message: 'Check your phone for the M-Pesa PIN prompt!',
       checkoutRequestID: stkResponse.data.CheckoutRequestID
     });
-
   } catch (error) {
-    console.error('❌ ERROR DETAILS:');
-    console.error('   Status:', error.response?.status);
-    console.error('   Headers:', error.response?.headers);
-    console.error('   Data:', error.response?.data);
-    console.error('   Message:', error.message);
-    
-    // Try to extract the actual Safaricom error
-    let errorMsg = 'Payment failed. Please try again.';
-    
-    if (error.response?.data) {
-      // If it's a string, try to parse it
-      if (typeof error.response.data === 'string') {
-        try {
-          const parsed = JSON.parse(error.response.data);
-          errorMsg = parsed.errorMessage || parsed.ResponseDescription || parsed.message || errorMsg;
-        } catch {
-          errorMsg = error.response.data || errorMsg;
-        }
-      } else {
-        // It's already an object
-        errorMsg = error.response.data.errorMessage || 
-                   error.response.data.ResponseDescription || 
-                   error.response.data.message || 
-                   errorMsg;
-      }
-    }
-
+    console.error('❌ Error:', error.response?.data || error.message);
+    const errorMsg = error.response?.data?.errorMessage || 'Payment failed. Please try again.';
     res.status(500).json({ error: errorMsg });
   }
 });
 
 // ─── /callback ENDPOINT ───
 app.post('/callback', (req, res) => {
-  console.log('🔔 Callback received:', JSON.stringify(req.body, null, 2));
+  console.log('🔔 Callback received');
+
+  const result = req.body.Body?.stkCallback;
+  if (!result) {
+    return res.status(400).json({ message: 'Invalid callback format' });
+  }
+
+  const checkoutRequestID = result.CheckoutRequestID;
+  const resultCode = result.ResultCode;
+
+  const supporter = supporters.find(s => s.checkoutRequestID === checkoutRequestID);
+
+  if (supporter) {
+    supporter.status = resultCode === 0 ? 'confirmed' : 'failed';
+
+    if (resultCode === 0) {
+      const metadata = result.CallbackMetadata?.Item || [];
+      const receipt = metadata.find(item => item.Name === 'MpesaReceiptNumber');
+      const amount = metadata.find(item => item.Name === 'Amount');
+
+      supporter.receiptNumber = receipt?.Value;
+      supporter.transactionAmount = amount?.Value;
+
+      // ─── AUTO-RSVP: Add to guest list if payment successful ───
+      // Check if already in guest list
+      const existingGuest = guests.find(g => g.phone === supporter.phone);
+      if (!existingGuest) {
+        guests.push({
+          name: supporter.name,
+          phone: supporter.phone,
+          status: 'confirmed',
+          rsvp: true,
+          receipt: supporter.receiptNumber,
+          paidAmount: supporter.transactionAmount
+        });
+        console.log(`✅ ${supporter.name} added to guest list!`);
+      } else if (!existingGuest.rsvp) {
+        existingGuest.rsvp = true;
+        existingGuest.status = 'confirmed';
+        console.log(`✅ ${supporter.name} updated to RSVP confirmed!`);
+      }
+
+      console.log(`✅ Payment confirmed for ${supporter.name}`);
+      console.log(`🧾 Receipt: ${supporter.receiptNumber}`);
+    } else {
+      console.log(`❌ Payment failed: ${result.ResultDesc}`);
+    }
+  }
+
   res.json({ message: 'Callback received' });
 });
 
-// ─── /status/:checkoutRequestID ───
+// ─── /status ENDPOINT ───
 app.get('/status/:checkoutRequestID', (req, res) => {
   const supporter = supporters.find(
     s => s.checkoutRequestID === req.params.checkoutRequestID
@@ -182,10 +200,60 @@ app.get('/status/:checkoutRequestID', (req, res) => {
   res.json(supporter || { status: 'not_found' });
 });
 
-// ─── /supporters ───
-app.get('/supporters', (req, res) => {
-  const confirmed = supporters.filter(s => s.status === 'confirmed');
-  res.json(confirmed);
+// ─── /guest-list ENDPOINT ───
+app.get('/guest-list', (req, res) => {
+  // Return all confirmed guests (for admin view)
+  const confirmedGuests = guests.filter(g => g.rsvp === true);
+  res.json(confirmedGuests);
+});
+
+// ─── /guest/:phone ENDPOINT ───
+app.get('/guest/:phone', (req, res) => {
+  const formattedPhone = formatPhone(req.params.phone);
+  const guest = guests.find(g => g.phone === formattedPhone);
+  if (guest) {
+    res.json(guest);
+  } else {
+    res.json({ status: 'not_found' });
+  }
+});
+
+// ─── /rsvp ENDPOINT ───
+app.post('/rsvp', (req, res) => {
+  const { phone, name } = req.body;
+  const formattedPhone = formatPhone(phone);
+
+  // Check if already RSVP'd
+  const existingGuest = guests.find(g => g.phone === formattedPhone);
+  if (existingGuest && existingGuest.rsvp === true) {
+    return res.json({ 
+      message: 'You are already on the guest list! 🎉',
+      alreadyConfirmed: true
+    });
+  }
+
+  // If guest exists but didn't RSVP (e.g., paid but system didn't add)
+  if (existingGuest) {
+    existingGuest.rsvp = true;
+    existingGuest.status = 'confirmed';
+    return res.json({ 
+      message: 'You are now on the guest list! 🎉',
+      success: true
+    });
+  }
+
+  // New guest
+  guests.push({
+    name: name || 'Guest',
+    phone: formattedPhone,
+    status: 'confirmed',
+    rsvp: true
+  });
+
+  res.json({ 
+    message: 'You are now on the guest list! 🎉',
+    success: true
+  });
 });
 
 // ─── HEALTH CHECK ───
@@ -194,8 +262,7 @@ app.get('/health', (req, res) => {
     status: 'OK',
     environment: process.env.MPESA_ENV,
     shortcode: process.env.MPESA_SHORTCODE,
-    callback: process.env.CALLBACK_BASE_URL,
-    consumerKey: process.env.MPESA_CONSUMER_KEY ? '✅ SET' : '❌ MISSING'
+    totalGuests: guests.filter(g => g.rsvp === true).length
   });
 });
 
@@ -205,6 +272,6 @@ app.listen(PORT, () => {
   console.log('🚀 Dela Birthday Backend Running');
   console.log(`🌍 Environment: ${process.env.MPESA_ENV || 'NOT SET!'}`);
   console.log(`🏪 Shortcode: ${process.env.MPESA_SHORTCODE || 'NOT SET!'}`);
-  console.log(`📡 Callback: ${process.env.CALLBACK_BASE_URL || 'NOT SET!'}/callback`);
+  console.log(`👥 Guests: ${guests.filter(g => g.rsvp === true).length}`);
   console.log('═══════════════════════════════════════════════');
 });
