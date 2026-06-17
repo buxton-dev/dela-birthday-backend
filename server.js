@@ -15,13 +15,7 @@ app.use(express.json());
 let supporters = [];        // Payment records
 let guests = [];            // Guest list (confirmed RSVPs)
 
-// ─── TEST DATA (You can remove this) ───
-// These will show up as examples
-const testGuests = [
-  { name: 'Delaquez', phone: '254712345678', status: 'confirmed', rsvp: true },
-  { name: 'Sandra', phone: '254798765432', status: 'confirmed', rsvp: true },
-];
-guests.push(...testGuests);
+
 
 // ─── HELPERS ───
 function formatPhone(phone) {
@@ -110,7 +104,7 @@ app.post('/pay', async (req, res) => {
       PartyB: process.env.MPESA_SHORTCODE,
       PhoneNumber: formattedPhone,
       CallBackURL: `${process.env.CALLBACK_BASE_URL}/callback`,
-      AccountReference: 'DelaSandraBday',
+      AccountReference: 'DelaAndSandraBTD',
       TransactionDesc: `Birthday support from ${name}`
     };
 
