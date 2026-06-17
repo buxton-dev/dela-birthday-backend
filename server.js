@@ -1,5 +1,5 @@
 // ============================================
-// DELA BIRTHDAY SUPPORT BACKEND - COMPLETE FIXED VERSION
+// DELA BIRTHDAY SUPPORT BACKEND - FIXED ERROR HANDLING
 // ============================================
 
 require('dotenv').config();
@@ -20,34 +20,35 @@ async function getAccessToken() {
       ? 'https://api.safaricom.co.ke/oauth/v1/generate?grant_type=client_credentials'
       : 'https://sandbox.safaricom.co.ke/oauth/v1/generate?grant_type=client_credentials';
 
+  console.log('🔑 Getting token from:', url);
+  console.log('🔑 Consumer Key:', process.env.MPESA_CONSUMER_KEY ? '✅ SET' : '❌ MISSING');
+
   const auth = Buffer.from(
     `${process.env.MPESA_CONSUMER_KEY}:${process.env.MPESA_CONSUMER_SECRET}`
   ).toString('base64');
 
-  const response = await axios.get(url, {
-    headers: { Authorization: `Basic ${auth}` }
-  });
-
-  return response.data.access_token;
+  try {
+    const response = await axios.get(url, {
+      headers: { Authorization: `Basic ${auth}` }
+    });
+    console.log('✅ Token obtained successfully');
+    return response.data.access_token;
+  } catch (error) {
+    console.error('❌ Failed to get token:');
+    console.error('   Status:', error.response?.status);
+    console.error('   Data:', JSON.stringify(error.response?.data, null, 2));
+    throw new Error('Failed to authenticate with Safaricom. Check your Consumer Key and Secret.');
+  }
 }
 
 // ─── FORMAT PHONE NUMBER ───
 function formatPhone(phone) {
-  // Remove spaces, dashes, brackets
   let cleaned = phone.replace(/[\s\-\(\)]/g, '');
-  
-  // Remove leading + if present
   cleaned = cleaned.replace(/^\+/, '');
-  
-  // If it starts with 0, remove it (e.g., 0712345678 → 712345678)
   cleaned = cleaned.replace(/^0/, '');
-  
-  // If it starts with 254, keep it
-  // If it doesn't start with 254, add it
   if (!cleaned.startsWith('254')) {
     cleaned = '254' + cleaned;
   }
-  
   return cleaned;
 }
 
@@ -58,7 +59,6 @@ app.post('/pay', async (req, res) => {
 
     console.log('📥 Received:', { phone, amount, name });
 
-    // Validate
     if (!phone || !amount || !name) {
       return res.status(400).json({ error: 'Name, phone, and amount are required.' });
     }
@@ -66,7 +66,6 @@ app.post('/pay', async (req, res) => {
       return res.status(400).json({ error: 'Amount must be at least 1 KES.' });
     }
 
-    // Format phone: 07XXXXXXX → 2547XXXXXXXX
     const formattedPhone = formatPhone(phone);
     console.log('📱 Formatted phone:', formattedPhone);
 
@@ -78,15 +77,12 @@ app.post('/pay', async (req, res) => {
 
     // Get token
     const token = await getAccessToken();
-    console.log('✅ Token obtained');
 
-    // Generate timestamp
     const timestamp = new Date()
       .toISOString()
       .replace(/[^0-9]/g, '')
       .slice(0, 14);
 
-    // Generate password
     const password = Buffer.from(
       `${process.env.MPESA_SHORTCODE}${process.env.MPESA_PASSKEY}${timestamp}`
     ).toString('base64');
@@ -96,8 +92,11 @@ app.post('/pay', async (req, res) => {
         ? 'https://api.safaricom.co.ke/mpesa/stkpush/v1/processrequest'
         : 'https://sandbox.safaricom.co.ke/mpesa/stkpush/v1/processrequest';
 
-    console.log('📤 Sending to:', stkUrl);
-    console.log('📤 Shortcode:', process.env.MPESA_SHORTCODE);
+    console.log('📤 Sending to Safaricom:');
+    console.log('   URL:', stkUrl);
+    console.log('   Shortcode:', process.env.MPESA_SHORTCODE);
+    console.log('   Phone:', formattedPhone);
+    console.log('   Amount:', amount);
 
     const payload = {
       BusinessShortCode: process.env.MPESA_SHORTCODE,
@@ -113,15 +112,17 @@ app.post('/pay', async (req, res) => {
       TransactionDesc: `Birthday support from ${name}`
     };
 
-    console.log('📤 Payload:', JSON.stringify(payload, null, 2));
+    console.log('📤 Full Payload:', JSON.stringify(payload, null, 2));
 
     const stkResponse = await axios.post(stkUrl, payload, {
-      headers: { Authorization: `Bearer ${token}` }
+      headers: { 
+        Authorization: `Bearer ${token}`,
+        'Content-Type': 'application/json'
+      }
     });
 
     console.log('✅ Success:', stkResponse.data);
 
-    // Store supporter
     supporters.push({
       name,
       phone: formattedPhone,
@@ -136,15 +137,32 @@ app.post('/pay', async (req, res) => {
     });
 
   } catch (error) {
-    console.error('❌ Error:');
+    console.error('❌ ERROR DETAILS:');
     console.error('   Status:', error.response?.status);
-    console.error('   Data:', JSON.stringify(error.response?.data, null, 2));
+    console.error('   Headers:', error.response?.headers);
+    console.error('   Data:', error.response?.data);
     console.error('   Message:', error.message);
-
-    const errorMsg = error.response?.data?.errorMessage ||
-                     error.response?.data?.ResponseDescription ||
-                     error.response?.data?.message ||
-                     'Payment request failed. Please try again.';
+    
+    // Try to extract the actual Safaricom error
+    let errorMsg = 'Payment failed. Please try again.';
+    
+    if (error.response?.data) {
+      // If it's a string, try to parse it
+      if (typeof error.response.data === 'string') {
+        try {
+          const parsed = JSON.parse(error.response.data);
+          errorMsg = parsed.errorMessage || parsed.ResponseDescription || parsed.message || errorMsg;
+        } catch {
+          errorMsg = error.response.data || errorMsg;
+        }
+      } else {
+        // It's already an object
+        errorMsg = error.response.data.errorMessage || 
+                   error.response.data.ResponseDescription || 
+                   error.response.data.message || 
+                   errorMsg;
+      }
+    }
 
     res.status(500).json({ error: errorMsg });
   }
@@ -153,22 +171,6 @@ app.post('/pay', async (req, res) => {
 // ─── /callback ENDPOINT ───
 app.post('/callback', (req, res) => {
   console.log('🔔 Callback received:', JSON.stringify(req.body, null, 2));
-
-  const result = req.body.Body?.stkCallback;
-  if (!result) {
-    return res.status(400).json({ message: 'Invalid callback format' });
-  }
-
-  const checkoutRequestID = result.CheckoutRequestID;
-  const resultCode = result.ResultCode;
-
-  const supporter = supporters.find(s => s.checkoutRequestID === checkoutRequestID);
-
-  if (supporter) {
-    supporter.status = resultCode === 0 ? 'confirmed' : 'failed';
-    console.log(`✅ Supporter ${supporter.name} status: ${supporter.status}`);
-  }
-
   res.json({ message: 'Callback received' });
 });
 
@@ -193,11 +195,10 @@ app.get('/health', (req, res) => {
     environment: process.env.MPESA_ENV,
     shortcode: process.env.MPESA_SHORTCODE,
     callback: process.env.CALLBACK_BASE_URL,
-    supporters: supporters.filter(s => s.status === 'confirmed').length
+    consumerKey: process.env.MPESA_CONSUMER_KEY ? '✅ SET' : '❌ MISSING'
   });
 });
 
-// ─── START SERVER ───
 const PORT = process.env.PORT || 3000;
 app.listen(PORT, () => {
   console.log('═══════════════════════════════════════════════');
@@ -205,8 +206,5 @@ app.listen(PORT, () => {
   console.log(`🌍 Environment: ${process.env.MPESA_ENV || 'NOT SET!'}`);
   console.log(`🏪 Shortcode: ${process.env.MPESA_SHORTCODE || 'NOT SET!'}`);
   console.log(`📡 Callback: ${process.env.CALLBACK_BASE_URL || 'NOT SET!'}/callback`);
-  console.log(`🔑 Consumer Key: ${process.env.MPESA_CONSUMER_KEY ? '✅ SET' : '❌ MISSING'}`);
-  console.log(`🔐 Consumer Secret: ${process.env.MPESA_CONSUMER_SECRET ? '✅ SET' : '❌ MISSING'}`);
-  console.log(`🔑 Passkey: ${process.env.MPESA_PASSKEY ? '✅ SET' : '❌ MISSING'}`);
   console.log('═══════════════════════════════════════════════');
 });
