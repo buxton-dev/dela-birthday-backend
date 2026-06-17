@@ -102,7 +102,7 @@ app.post('/pay', async (req, res) => {
       BusinessShortCode: process.env.MPESA_SHORTCODE,
       Password: password,
       Timestamp: timestamp,
-      TransactionType: 'CustomerBuyGoodsOnline',
+      TransactionType: 'CustomerPayBillOnline',
       Amount: Math.round(amount),
       PartyA: formattedPhone,
       PartyB: process.env.MPESA_SHORTCODE,
